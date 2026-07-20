@@ -89,6 +89,21 @@ extension PostgresRow {
                 context: .default
             )
         }
+
+        /// Metadata for the column most recently returned by `decodeNext`.
+        ///
+        /// Reading a column's name is what `PostgresCell` does eagerly, and
+        /// avoiding it per cell is most of this cursor's advantage. Exposing it
+        /// here lets a caller name the column **only when throwing**, so
+        /// diagnostics cost nothing on the success path.
+        @inlinable
+        public var lastColumn: (name: String, dataType: PostgresDataType)? {
+            guard self.columnIndex > 0, self.columnIndex <= self.columns.count else {
+                return nil
+            }
+            let column = self.columns[self.columnIndex - 1]
+            return (column.name, column.dataType)
+        }
     }
 
     /// A cursor that decodes columns in order without allocating a `ByteBuffer`
