@@ -1,3 +1,4 @@
+import NIOConcurrencyHelpers
 import NIOCore
 import Logging
 
@@ -46,6 +47,8 @@ final class PSQLRowStream: Sendable {
     internal let rowDescription: [RowDescription.Column]
     private let lookupTable: [String: Int]
     private let downstreamStateBox: NIOLoopBoundBox<DownstreamState>
+    /// Backs ``reportedCommandTag``. Written once, where the server's completion arrives.
+    private let reportedCommandTagBox = NIOLockedValueBox<String?>(nil)
 
     init(
         source: Source,
@@ -76,6 +79,17 @@ final class PSQLRowStream: Sendable {
             lookup[column.name] = index
         }
         self.lookupTable = lookup
+
+        // A statement that produced no rows has already completed. Record its tag here, so
+        // that `reportedCommandTag` answers for it just as it does for a streaming one.
+        switch source {
+        case .noRows(.success(.tag(let commandTag))):
+            self.reportedCommandTagBox.withLockedValue { $0 = commandTag }
+        case .noRows(.success(.emptyResponse)):
+            self.reportedCommandTagBox.withLockedValue { $0 = "" }
+        case .noRows(.failure), .stream:
+            break
+        }
     }
 
     // Every state modification below returns the side effects it wants to have run as an action. The
@@ -138,7 +152,12 @@ final class PSQLRowStream: Sendable {
             source.finish(error)
         }
 
-        return PostgresRowSequence(producer.sequence, lookupTable: self.lookupTable, columns: self.rowDescription)
+        return PostgresRowSequence(
+            producer.sequence,
+            lookupTable: self.lookupTable,
+            columns: self.rowDescription,
+            rowStream: self
+        )
     }
 
     func demand() {
@@ -420,6 +439,10 @@ final class PSQLRowStream: Sendable {
     }
 
     private func receiveEnd(_ commandTag: String) {
+        // Before the downstream state moves on: from here a consumer that has drained its
+        // rows may read the tag, and it may do so from any executor.
+        self.reportedCommandTagBox.withLockedValue { $0 = commandTag }
+
         let action = self.downstreamStateBox.withValue { state -> ReceiveEndAction in
             switch state {
             case .waitingForConsumer(.streaming(buffer: let buffer, _)):
@@ -594,6 +617,24 @@ final class PSQLRowStream: Sendable {
         case .emptyResponse:
             return ""
         }
+    }
+
+    /// The command tag the server reported for this statement, or `nil` if it has not
+    /// reported one yet.
+    ///
+    /// ``commandTag`` reads the same value out of the loop bound downstream state, so it may
+    /// only be read on the stream's `EventLoop` and traps unless every row has been consumed.
+    /// Neither holds for a consumer of ``PostgresRowSequence``: it runs on an arbitrary
+    /// executor, and it is public API that must not trap. So the tag is recorded here as
+    /// well, under a lock, the moment the server reports it.
+    ///
+    /// Hopping onto the loop instead — `eventLoop.submit { self.commandTag }.get()` — is the
+    /// obvious alternative and is wrong. `EmbeddedEventLoop` only runs submitted work when it
+    /// is driven, so the hop never completes for a caller that is `await`ing it, and
+    /// `PostgresRowSequenceTests` drives its streams with exactly that loop. The hop would
+    /// make anything built on this untestable in the unit suite.
+    var reportedCommandTag: String? {
+        self.reportedCommandTagBox.withLockedValue { $0 }
     }
 }
 

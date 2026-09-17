@@ -94,6 +94,68 @@ struct IntegrationTests {
         }
     }
 
+    @Test func queryReportsAffectedRowsWithoutReturning() async throws {
+        try await withConnection { connection in
+            _ = try? await connection.query("DROP TABLE metadata_table", logger: .psqlTest)
+            _ = try await connection.query("CREATE TABLE metadata_table (id INT)", logger: .psqlTest).consume()
+
+            let inserted = try await connection.query(
+                "INSERT INTO metadata_table (id) VALUES (1), (2), (3)", logger: .psqlTest
+            ).consume()
+            #expect(inserted.command == "INSERT")
+            #expect(inserted.rows == 3)
+
+            let updated = try await connection.query(
+                "UPDATE metadata_table SET id = id + 10 WHERE id > 1", logger: .psqlTest
+            ).consume()
+            #expect(updated.command == "UPDATE")
+            #expect(updated.rows == 2)
+
+            let deleted = try await connection.query(
+                "DELETE FROM metadata_table WHERE id > 1", logger: .psqlTest
+            ).consume()
+            #expect(deleted.command == "DELETE")
+            #expect(deleted.rows == 2)
+
+            _ = try await connection.query("DROP TABLE metadata_table", logger: .psqlTest).consume()
+        }
+    }
+
+    @Test func queryReportsRollbackForACommitThatDidNotCommit() async throws {
+        try await withConnection { connection in
+            // A transaction that commits reports COMMIT, so that the ROLLBACK below is a
+            // report of what happened and not simply what a COMMIT always answers.
+            #expect(try await connection.query("BEGIN", logger: .psqlTest).consume().command == "BEGIN")
+            #expect(try await connection.query("COMMIT", logger: .psqlTest).consume().command == "COMMIT")
+
+            _ = try await connection.query("BEGIN", logger: .psqlTest).consume()
+            await #expect(throws: PSQLError.self) {
+                _ = try await connection.query("SELECT no_such_function()", logger: .psqlTest).consume()
+            }
+
+            // A COMMIT on an aborted transaction reports ROLLBACK and raises no error. Every
+            // write in the transaction has been discarded.
+            let rolledBack = try await connection.query("COMMIT", logger: .psqlTest).consume()
+            #expect(rolledBack.command == "ROLLBACK")
+        }
+    }
+
+    @Test func queryCollectsRowsAndMetadataTogether() async throws {
+        try await withConnection { connection in
+            let result = try await connection.query("SELECT generate_series(1, 3)", logger: .psqlTest)
+                .collectWithMetadata()
+            #expect(try result.rows.map { try $0.decode(Int.self, context: .default) } == [1, 2, 3])
+            #expect(result.metadata.command == "SELECT")
+            #expect(result.metadata.rows == 3)
+
+            var streamed = 0
+            let metadata = try await connection.query("SELECT generate_series(1, 3)", logger: .psqlTest)
+                .consume { _ in streamed += 1 }
+            #expect(streamed == 3)
+            #expect(metadata.rows == 3)
+        }
+    }
+
     @Test func decodeIntegers() async throws {
         try await withConnection { connection in
             let rows = try await connection.query(

@@ -12,11 +12,20 @@ public struct PostgresRowSequence: AsyncSequence, Sendable {
     let backing: BackingSequence
     let lookupTable: [String: Int]
     let _columns: [RowDescription.Column]
+    /// The stream that produced this sequence. It records the statement's command tag, which
+    /// the consuming operations in `PostgresRowSequence+Metadata.swift` return.
+    let rowStream: PSQLRowStream
 
-    init(_ backing: BackingSequence, lookupTable: [String: Int], columns: [RowDescription.Column]) {
+    init(
+        _ backing: BackingSequence,
+        lookupTable: [String: Int],
+        columns: [RowDescription.Column],
+        rowStream: PSQLRowStream
+    ) {
         self.backing = backing
         self.lookupTable = lookupTable
         self._columns = columns
+        self.rowStream = rowStream
     }
 
     public func makeAsyncIterator() -> AsyncIterator {

@@ -728,6 +728,58 @@ import Logging
         try await eventLoop.submit { }.get() // wait for the hop to complete
         #expect(dataSource.cancelCount == 1)
     }
+
+    @Test func testCollectWithMetadataReturnsRowsAndTheCommandTag() async throws {
+        let dataSource = MockRowDataSource()
+        let embeddedEventLoop = EmbeddedEventLoop()
+        let stream = PSQLRowStream(
+            source: .stream(
+                [
+                    .init(name: "test", tableOID: 0, columnAttributeNumber: 0, dataType: .int8, dataTypeSize: 8, dataTypeModifier: 0, format: .binary)
+                ],
+                dataSource
+            ),
+            eventLoop: embeddedEventLoop,
+            logger: self.logger
+        )
+
+        let rowSequence = stream.asyncSequence()
+        stream.receive((0..<3).map { [ByteBuffer(integer: Int64($0))] })
+        stream.receive(completion: .success("SELECT 3"))
+
+        let result = try await rowSequence.collectWithMetadata()
+        #expect(result.rows.count == 3)
+        #expect(try result.rows.map { try $0.decode(Int.self) } == [0, 1, 2])
+        #expect(result.metadata.command == "SELECT")
+        #expect(result.metadata.rows == 3)
+    }
+
+    @Test func testConsumeReportsTheCommandTagOfAStatementWithoutRows() async throws {
+        let stream = PSQLRowStream(
+            source: .noRows(.success(.tag("UPDATE 2"))),
+            eventLoop: EmbeddedEventLoop(),
+            logger: self.logger
+        )
+
+        let metadata = try await stream.asyncSequence().consume()
+        #expect(metadata.command == "UPDATE")
+        #expect(metadata.rows == 2)
+    }
+
+    @Test func testConsumeThrowsOnACommandTagItCannotParse() async throws {
+        let stream = PSQLRowStream(
+            // `INSERT` must report an oid and a row count.
+            source: .noRows(.success(.tag("INSERT 1"))),
+            eventLoop: EmbeddedEventLoop(),
+            logger: self.logger
+        )
+
+        let sequence = stream.asyncSequence()
+        let error = await #expect(throws: PSQLError.self) {
+            try await sequence.consume()
+        }
+        #expect(error?.code == .invalidCommandTag)
+    }
 }
 
 final class MockRowDataSource: PSQLRowsDataSource, Sendable {
