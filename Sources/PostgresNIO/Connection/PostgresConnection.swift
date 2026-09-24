@@ -294,6 +294,21 @@ public final class PostgresConnection: Sendable {
 
     // MARK: Query
 
+    /// Check and send on the same event-loop turn. Checking `isActive` on the
+    /// caller's executor leaves a close-between-check-and-write race; writing
+    /// to an already removed pipeline otherwise strands the context promise.
+    private func sendQuery(_ context: ExtendedQueryContext) {
+        let send: @Sendable () -> Void = {
+            guard self.channel.isActive else {
+                PSQLTask.extendedQuery(context).failWithError(.clientClosedConnection(underlying: nil))
+                return
+            }
+            self.channel.write(HandlerTask.extendedQuery(context), promise: nil)
+        }
+        if self.channel.eventLoop.inEventLoop { send() }
+        else { self.channel.eventLoop.execute(send) }
+    }
+
     private func queryStream(_ query: PostgresQuery, logger: Logger) -> EventLoopFuture<PSQLRowStream> {
         var logger = logger
         logger[postgresMetadataKey: .connectionID] = "\(self.id)"
@@ -308,7 +323,7 @@ public final class PostgresConnection: Sendable {
             promise: promise
         )
 
-        self.channel.write(HandlerTask.extendedQuery(context), promise: nil)
+        self.sendQuery(context)
 
         return promise.futureResult
     }
@@ -325,7 +340,7 @@ public final class PostgresConnection: Sendable {
             promise: promise
         )
 
-        self.channel.write(HandlerTask.extendedQuery(context), promise: nil)
+        self.sendQuery(context)
         return promise.futureResult.map { rowDescription in
             PSQLPreparedStatement(name: name, query: query, connection: self, rowDescription: rowDescription)
         }
@@ -341,7 +356,7 @@ public final class PostgresConnection: Sendable {
             logger: logger,
             promise: promise)
 
-        self.channel.write(HandlerTask.extendedQuery(context), promise: nil)
+        self.sendQuery(context)
         return promise.futureResult
     }
 
@@ -518,7 +533,7 @@ extension PostgresConnection {
             promise: promise
         )
 
-        self.channel.write(HandlerTask.extendedQuery(context), promise: nil)
+        self.sendQuery(context)
 
         do {
             return try await promise.futureResult.map({ $0.asyncSequence() }).get()

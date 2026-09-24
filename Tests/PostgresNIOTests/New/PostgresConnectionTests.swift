@@ -1,4 +1,5 @@
 import NIOCore
+import NIOConcurrencyHelpers
 import NIOPosix
 import NIOEmbedded
 import Testing
@@ -417,6 +418,41 @@ import Synchronization
                         Issue.record("Unexpected error: \(failure)")
                     }
                 }
+            }
+        }
+    }
+
+    @Test func queryOnClosedConnectionFailsInsteadOfStrandingItsPromise() async throws {
+        try await self.withAsyncTestingChannel { connection, channel in
+            try await connection.close()
+            let result = NIOLockedValueBox<Result<PostgresQueryResult, any Error>?>(nil)
+            let future: EventLoopFuture<PostgresQueryResult> = connection.query("SELECT 1", logger: logger)
+            future.whenComplete { value in result.withLockedValue { $0 = value } }
+            // Flush the send and its completion callback without awaiting a
+            // potentially stranded result future in the regression case.
+            try await channel.testingEventLoop.executeInContext {}
+            try await channel.testingEventLoop.executeInContext {}
+            let completed = result.withLockedValue { $0 }
+            guard let completed else {
+                Issue.record("Query on closed connection left its promise unresolved")
+                return
+            }
+            switch completed {
+            case .success: Issue.record("Closed connection accepted a query")
+            case .failure(let error):
+                #expect((error as? PSQLError)?.code == .clientClosedConnection)
+            }
+        }
+    }
+
+    @Test func asyncQueryOnClosedConnectionThrows() async throws {
+        try await self.withAsyncTestingChannel { connection, _ in
+            try await connection.close()
+            do {
+                let _: PostgresRowSequence = try await connection.query("SELECT 1", logger: logger)
+                Issue.record("Closed connection accepted async query")
+            } catch let error as PSQLError {
+                #expect(error.code == .clientClosedConnection)
             }
         }
     }
