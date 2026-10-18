@@ -9,6 +9,34 @@ import Foundation
 @Suite(.serialized)
 struct PostgresClientTests {
 
+    /// A connection whose backend died can be handed back to the pool before
+    /// the pool sees the close. A pool query written to it must fail rather than
+    /// strand its promise: a stranded promise hangs the caller forever and never
+    /// releases the lease, so the pool loses that connection slot for good.
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test(.timeLimit(.minutes(1)))
+    func poolQueryAfterBackendTerminationNeverHangs() async throws {
+        var config = PostgresClient.Configuration.makeTestConfiguration()
+        config.options.maximumConnections = 1
+        let client = PostgresClient(
+            configuration: config, eventLoopGroup: MultiThreadedEventLoopGroup.singleton,
+            backgroundLogger: Logger(label: "test")
+        )
+        try await withThrowingTaskGroup(of: Void.self) { taskGroup in
+            taskGroup.addTask { await client.run() }
+            for _ in 0..<200 {
+                // The backend kills itself; the error reaches us before the
+                // channel close does, and the lease goes back to the pool.
+                _ = try? await client.withConnection { connection in
+                    try await connection.query("SELECT pg_terminate_backend(pg_backend_pid())", logger: Logger(label: "test"))
+                }
+                // Either answers or fails. Hanging is the bug.
+                _ = try? await client.query("SELECT 1")
+            }
+            taskGroup.cancelAll()
+        }
+    }
+
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test func getConnection() async throws {
         var mlogger = Logger(label: "test")

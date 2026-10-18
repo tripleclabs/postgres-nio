@@ -384,7 +384,7 @@ extension PostgresConnection {
                 triggerCopy: continuation,
                 logger: logger
             )
-            self.channel.write(HandlerTask.extendedQuery(context), promise: nil)
+            self.sendQuery(context)
         }
 
         do {

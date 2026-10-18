@@ -297,7 +297,10 @@ public final class PostgresConnection: Sendable {
     /// Check and send on the same event-loop turn. Checking `isActive` on the
     /// caller's executor leaves a close-between-check-and-write race; writing
     /// to an already removed pipeline otherwise strands the context promise.
-    private func sendQuery(_ context: ExtendedQueryContext) {
+    /// Every extended query goes through here, including the pool's: a pooled
+    /// connection can be leased after its channel closed but before the pool
+    /// saw the close, and a stranded promise there also never releases the lease.
+    func sendQuery(_ context: ExtendedQueryContext) {
         let send: @Sendable () -> Void = {
             guard self.channel.isActive else {
                 PSQLTask.extendedQuery(context).failWithError(.clientClosedConnection(underlying: nil))
