@@ -86,6 +86,16 @@ extension PostgresBackendMessage {
         init(fields: [PostgresBackendMessage.Field: String]) {
             self.fields = fields
         }
+
+        /// FATAL and PANIC end the backend session; the server closes the
+        /// socket right after sending them. Only the unlocalized `V` field is
+        /// trusted: `S` is translated by `lc_messages`.
+        var terminatesSession: Bool {
+            switch self.fields[.severity] {
+            case "FATAL", "PANIC": return true
+            default: return false
+            }
+        }
     }
     
     struct NoticeResponse: PSQLMessageNotice, PayloadDecodable, Hashable {

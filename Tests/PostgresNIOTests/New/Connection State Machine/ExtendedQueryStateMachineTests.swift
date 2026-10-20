@@ -297,6 +297,28 @@ import Logging
         #expect(state.readyForQueryReceived(.idle) == .fireEventReadyForQuery)
     }
 
+    @Test func testFatalQueryErrorClosesConnection() throws {
+        var state = try ConnectionStateMachine.makeReadyForQuery()
+
+        let logger = Logger.psqlTest
+        let promise = EmbeddedEventLoop().makePromise(of: PSQLRowStream.self)
+        promise.fail(PSQLError.uncleanShutdown) // we don't care about the error at all.
+        let query: PostgresQuery = "SELECT pg_sleep(30)"
+        let queryContext = ExtendedQueryContext(query: query, logger: logger, promise: promise)
+
+        #expect(state.enqueue(task: .extendedQuery(queryContext)) == .sendParseDescribeBindExecuteSync(query))
+        #expect(state.parseCompleteReceived() == .wait)
+        #expect(state.parameterDescriptionReceived(.init(dataTypes: [.int8])) == .wait)
+
+        // pg_terminate_backend: the server ends the session right after this
+        // message, so the connection must not wait for ReadyForQuery.
+        let serverError = PostgresBackendMessage.ErrorResponse(fields: [.localizedSeverity: "SCHWERWIEGEND", .severity: "FATAL", .sqlState: "57P01"])
+        let error = PSQLError.server(serverError)
+        #expect(
+            state.errorReceived(serverError) == .failQuery(promise, with: error, cleanupContext: .init(action: .close, tasks: [], error: error, closePromise: nil))
+        )
+    }
+
     @Test func testQueryErrorAfterCancelDoesNotKillConnection() throws {
         var state = try ConnectionStateMachine.makeReadyForQuery()
 

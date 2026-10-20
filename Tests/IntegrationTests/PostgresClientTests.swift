@@ -37,6 +37,45 @@ struct PostgresClientTests {
         }
     }
 
+    /// A lessee that saw its backend die mid-query releases a lease the pool
+    /// must not hand to the next borrower: the following queries have to run on
+    /// a new connection rather than fail on the dead one.
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test(.timeLimit(.minutes(1)))
+    func poolNeverLeasesAConnectionWhoseQueryFailedOnBackendTermination() async throws {
+        var config = PostgresClient.Configuration.makeTestConfiguration()
+        config.options.maximumConnections = 1
+        let client = PostgresClient(
+            configuration: config, eventLoopGroup: MultiThreadedEventLoopGroup.singleton,
+            backgroundLogger: Logger(label: "test")
+        )
+        let logger = Logger(label: "test")
+        let killer = try await PostgresConnection.test(on: MultiThreadedEventLoopGroup.singleton.any()).get()
+        defer { try? killer.close().wait() }
+        try await withThrowingTaskGroup(of: Void.self) { taskGroup in
+            taskGroup.addTask { await client.run() }
+            for _ in 0..<50 {
+                await #expect(throws: PSQLError.self) {
+                    try await client.withConnection { connection in
+                        let rows = try await connection.query("SELECT pg_backend_pid()", logger: logger)
+                        var pid: Int32 = 0
+                        for try await row in rows.decode(Int32.self) { pid = row }
+                        async let killed = killer.query("SELECT pg_terminate_backend(\(pid))", logger: logger)
+                        // Dies mid-statement: the error reaches this lessee before
+                        // the lease returns to the pool.
+                        for try await _ in try await connection.query("SELECT pg_sleep(30)", logger: logger) {}
+                        _ = try await killed
+                    }
+                }
+                try await client.query("SELECT 1")
+                try await client.withConnection { connection in
+                    try await connection.query("SELECT 1", logger: logger)
+                }
+            }
+            taskGroup.cancelAll()
+        }
+    }
+
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test func getConnection() async throws {
         var mlogger = Logger(label: "test")

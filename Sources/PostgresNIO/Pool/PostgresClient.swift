@@ -493,7 +493,18 @@ public final class PostgresClient: Sendable, ServiceLifecycle.Service {
         if !self.runningAtomic.load(ordering: .relaxed) {
             self.backgroundLogger.warning("Trying to lease connection from `PostgresClient`, but `PostgresClient.run()` hasn't been called yet.")
         }
-        return try await self.pool.leaseConnection()
+        // A connection can be idle in the pool after its channel closed: the
+        // channel handler fails the in-flight query before it closes, so the
+        // failed query's owner can release the lease (and the next borrower
+        // lease it) before `closeFuture` tells the pool. Waiting for that
+        // future removes the connection from the pool, so retrying cannot
+        // pick the same one again.
+        while true {
+            let lease = try await self.pool.leaseConnection()
+            guard lease.connection.isClosed else { return lease }
+            try? await lease.connection.closeFuture.get()
+            lease.release()
+        }
     }
 
     /// Returns the default `EventLoopGroup` singleton, automatically selecting the best for the platform.

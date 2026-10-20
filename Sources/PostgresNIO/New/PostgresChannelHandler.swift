@@ -415,10 +415,12 @@ final class PostgresChannelHandler: ChannelDuplexHandler, RemovableChannelHandle
             }
             continuation.resume()
         case .failQuery(let promise, with: let error, let cleanupContext):
-            promise.fail(error)
+            // Close first, so a connection is already closed when its failure is
+            // observed (see `closeConnectionAndCleanup`).
             if let cleanupContext = cleanupContext {
                 self.closeConnectionAndCleanup(cleanupContext, context: context)
             }
+            promise.fail(error)
         case .failQueryContinuation(let continuation, with: let error, let sync, let cleanupContext):
             if sync {
                 self.encoder.sync()
@@ -454,12 +456,16 @@ final class PostgresChannelHandler: ChannelDuplexHandler, RemovableChannelHandle
             
             
         case .forwardStreamError(let error, let read, let cleanupContext):
-            self.rowStream!.receive(completion: .failure(error))
+            let rowStream = self.rowStream!
             self.rowStream = nil
             if let cleanupContext = cleanupContext {
                 self.closeConnectionAndCleanup(cleanupContext, context: context)
-            } else if read {
-                context.read()
+                rowStream.receive(completion: .failure(error))
+            } else {
+                rowStream.receive(completion: .failure(error))
+                if read {
+                    context.read()
+                }
             }
             
         case .provideAuthenticationContext:
@@ -489,24 +495,24 @@ final class PostgresChannelHandler: ChannelDuplexHandler, RemovableChannelHandle
         case .succeedPreparedStatementCreation(let promise, with: let rowDescription):
             promise.succeed(rowDescription)
         case .failPreparedStatementCreation(let promise, with: let error, let cleanupContext):
-            promise.fail(error)
             if let cleanupContext = cleanupContext {
                 self.closeConnectionAndCleanup(cleanupContext, context: context)
             }
+            promise.fail(error)
         case .sendCloseSync(let sendClose):
             self.sendCloseAndSyncMessage(sendClose, context: context)
         case .succeedClose(let closeContext):
             closeContext.promise.succeed(Void())
         case .failClose(let closeContext, with: let error, let cleanupContext):
-            closeContext.promise.fail(error)
             if let cleanupContext = cleanupContext {
                 self.closeConnectionAndCleanup(cleanupContext, context: context)
             }
+            closeContext.promise.fail(error)
         case .forwardNotificationToListeners(let notification):
             self.forwardNotificationToListeners(notification, context: context)
         case .failPromiseAndCloseConnection(let promise, let error, let cleanupContext):
-            promise.fail(error)
             self.closeConnectionAndCleanup(cleanupContext, context: context)
+            promise.fail(error)
         }
     }
     
@@ -654,26 +660,33 @@ final class PostgresChannelHandler: ChannelDuplexHandler, RemovableChannelHandle
             self.logger.debug("Cleaning up and closing connection.", metadata: [.error: "\(cleanup.error)"])
         }
 
-        // 1. fail all tasks
-        cleanup.tasks.forEach { task in
-            task.failWithError(cleanup.error)
+        let failTasksAndListeners = {
+            cleanup.tasks.forEach { task in
+                task.failWithError(cleanup.error)
+            }
+            for listener in self.listenState.fail(cleanup.error) {
+                listener.failed(cleanup.error)
+            }
+        }
+        let fireError = {
+            if cleanup.error.code != .clientClosedConnection {
+                context.fireErrorCaught(cleanup.error)
+            }
         }
 
-        // 2. stop all listeners
-        for listener in self.listenState.fail(cleanup.error) {
-            listener.failed(cleanup.error)
-        }
-
-        // 3. fire an error
-        if cleanup.error.code != .clientClosedConnection {
-            context.fireErrorCaught(cleanup.error)
-        }
-
-        // 4. close the connection or fire channel inactive
         switch cleanup.action {
         case .close:
+            // Close BEFORE failing tasks. A failed task's owner resumes on
+            // another thread and may release its pool lease at once; the
+            // connection must already report `isClosed` by then, or the pool
+            // hands the dead connection to the next borrower. The error still
+            // reaches the pipeline before `channelInactive` does.
+            fireError()
             context.close(mode: .all, promise: cleanup.closePromise)
+            failTasksAndListeners()
         case .fireChannelInactive:
+            failTasksAndListeners()
+            fireError()
             cleanup.closePromise?.succeed(())
             context.fireChannelInactive()
         }

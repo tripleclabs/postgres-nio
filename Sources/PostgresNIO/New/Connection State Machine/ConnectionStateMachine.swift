@@ -451,6 +451,9 @@ struct ConnectionStateMachine {
             if closeStateMachine.isComplete {
                 return self.closeConnectionAndCleanup(.unexpectedBackendMessage(.error(errorMessage)))
             }
+            if errorMessage.terminatesSession {
+                return self.closeConnectionAndCleanup(.server(errorMessage))
+            }
             self.state = .modifying // avoid CoW
             let action = closeStateMachine.errorReceived(errorMessage)
             self.state = .closeCommand(closeStateMachine, connectionContext)
@@ -459,6 +462,12 @@ struct ConnectionStateMachine {
         case .extendedQuery(var extendedQueryState, let connectionContext):
             if extendedQueryState.isComplete {
                 return self.closeConnectionAndCleanup(.unexpectedBackendMessage(.error(errorMessage)))
+            }
+            if errorMessage.terminatesSession {
+                // The backend is gone, not just this statement. Treating it as
+                // an ordinary query error keeps the connection "active" until
+                // the server's EOF is read, and a pool lends it out meanwhile.
+                return self.closeConnectionAndCleanup(.server(errorMessage))
             }
             self.state = .modifying // avoid CoW
             let action = extendedQueryState.errorReceived(errorMessage)
