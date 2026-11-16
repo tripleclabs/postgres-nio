@@ -982,21 +982,20 @@ typealias TestPoolStateMachine = PoolStateMachine<
         #expect(stateMachine.triggerGracefulShutdown() == .none())
         #expect(!stateMachine.isShutdown)
 
+        // the closed connection's capacity is replaced at once to help drain the queued requests
         let closedAction = stateMachine.connectionClosed(connection1)
         #expect(closedAction.request == .none)
-        #expect(closedAction.connection == .cancelTimers([]))
-        #expect(!stateMachine.isShutdown)
-
-        // creates a new connection to help drain
-        let drain1 = stateMachine.releaseConnection(connection2, streams: 1)
-        #expect(drain1.request == .leaseConnection(.init(element: mockRequest3), connection2))
-        guard 
-            case .makeConnectionsCancelAndScheduleTimers(let requests, _, _) = drain1.connection,
-            let newConnectionRequest = Array(requests).first
-        else {
-            Issue.record("Expected a connection to be created to help drain the queue, got \(drain1.connection)")
+        guard case .makeConnection(let newConnectionRequest, let cancelled) = closedAction.connection else {
+            Issue.record("Expected a connection to be created to help drain the queue, got \(closedAction.connection)")
             return
         }
+        #expect(Array(cancelled).isEmpty)
+        #expect(!stateMachine.isShutdown)
+
+        // that connection already covers the last queued request, so draining creates no more
+        let drain1 = stateMachine.releaseConnection(connection2, streams: 1)
+        #expect(drain1.request == .leaseConnection(.init(element: mockRequest3), connection2))
+        #expect(drain1.connection == .cancelTimers([]))
         
         // release manually created connections but is not ready to close because of auto-created third one
         #expect(stateMachine.releaseConnection(connection2, streams: 1).request == .leaseConnection(.init(element: mockRequest4), connection2))
@@ -1768,22 +1767,23 @@ typealias TestPoolStateMachine = PoolStateMachine<
             #expect(leaseRequests[i].request == .none)
         }
 
-        // only 4 connections are created as once 4 are created we have enough streams and connections available to serve
-        // all requests
-        let connections = (0..<4).map { MockConnection(id: $0) }
-        let connectedActions = (0..<4).map { stateMachine.connectionEstablished(connections[$0], maxStreams: 1) }
+        // The limit throttles how many connections are created at once, not how many queued requests get one:
+        // each established connection tops up creations until every queued request is covered by a connection
+        // being created. Leased connections do not count, since nothing says when they will be released.
+        let connections = (0..<5).map { MockConnection(id: $0) }
+        let connectedActions = (0..<5).map { stateMachine.connectionEstablished(connections[$0], maxStreams: 1) }
         #expect(connectedActions[0].connection == .makeConnectionsCancelAndScheduleTimers(.init(element: .init(connectionID: 3)), [], []))
-        #expect(connectedActions[1].connection == .cancelTimers([]))
+        #expect(connectedActions[1].connection == .makeConnectionsCancelAndScheduleTimers(.init(element: .init(connectionID: 4)), [], []))
         #expect(connectedActions[2].connection == .cancelTimers([]))
         #expect(connectedActions[3].connection == .cancelTimers([]))
-        for i in 0..<4 {
+        #expect(connectedActions[4].connection == .cancelTimers([]))
+        for i in 0..<5 {
             #expect(connectedActions[i].request == .leaseConnection([requests[i]], connections[i]))
         }
-        let releaseActions = (0..<4).map { stateMachine.releaseConnection(connections[$0], streams: 1)}
-        #expect(releaseActions[0].request == .leaseConnection([requests[4]], connections[0]))
-        #expect(releaseActions[1].request == .none)
-        #expect(releaseActions[2].request == .none)
-        #expect(releaseActions[3].request == .none)
+        let releaseActions = (0..<5).map { stateMachine.releaseConnection(connections[$0], streams: 1)}
+        for i in 0..<5 {
+            #expect(releaseActions[i].request == .none)
+        }
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
@@ -2070,17 +2070,18 @@ typealias TestPoolStateMachine = PoolStateMachine<
         // Pool enters connectionCreationFailing state and schedules a backoff timer
         #expect(failAction.request == .none)
 
-        // 4. A lease request arrives — gets queued because pool is in connectionCreationFailing
+        // 4. A lease request arrives while the pool is in connectionCreationFailing. Connection 0 is
+        //    idle, so it serves the request instead of the request waiting on the backing-off retry
+        //    (queued behind an idle connection, the request would wait while connection 0 idled out).
         let request = MockRequest(connectionType: MockConnection.self)
         let leaseAction = stateMachine.leaseConnection(request)
-        #expect(leaseAction.request == .none)  // queued, not served
-        #expect(leaseAction.connection == .none)
+        #expect(leaseAction.request == .leaseConnection(.init(element: request), connection0))
+        #expect(leaseAction.connection == .cancelTimers([cancel0]))
 
-        // 5. Keep-alive timer fires on connection 0 (still idle).
-        //    BUG: precondition(self.requestQueue.isEmpty) crashes here.
-        //    FIX: the guard on keepAliveIfIdle handles this safely.
+        // 5. A keep-alive timer that fires late, after connection 0 was leased, must be harmless.
+        //    (Originally: precondition(self.requestQueue.isEmpty) crashed here.)
         let keepAliveAction = stateMachine.connectionKeepAliveTimerTriggered(connection0.id)
-        #expect(keepAliveAction.connection == .runKeepAlive(connection0, cancel0))
+        #expect(keepAliveAction.connection == .none)
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)

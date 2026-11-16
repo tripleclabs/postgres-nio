@@ -292,6 +292,16 @@ struct PoolStateMachine<
                 return .none()
             }
         case .connectionCreationFailing:
+            // A failing creation does not make an open connection unusable: serve the request
+            // from an idle connection if there is one. Only otherwise wait for the single retry;
+            // queueing past an idle connection leaves it to time out under a waiting request.
+            if self.requestQueue.isEmpty,
+               case .leasedConnection(let leaseResult) = self.connections.leaseConnectionOrSoonAvailableConnectionCount() {
+                return .init(
+                    request: .leaseConnection(TinyFastSequence(element: request), leaseResult.connection),
+                    connection: .cancelTimers(.init(leaseResult.timersToCancel))
+                )
+            }
             self.requestQueue.queue(request)
             return .none()
 
@@ -708,11 +718,34 @@ struct PoolStateMachine<
 
             let closedConnectionAction = self.connections.connectionClosed(connection.id, shuttingDown: false)
 
-            let connectionAction: ConnectionAction
+            var newRequests = TinyFastSequence<ConnectionRequest>()
             if let newRequest = closedConnectionAction.newConnectionRequest {
-                connectionAction = .makeConnection(newRequest, closedConnectionAction.timersToCancel)
-            } else {
+                newRequests.append(newRequest)
+            }
+            if case .running = self.poolState {
+                // The closed connection may have been the capacity queued requests were waiting
+                // for (a request queued at the hard limit). Replace it for every queued request
+                // that no connection being created or retried covers; otherwise those requests
+                // wait for an unrelated new request to trigger a creation.
+                let pending = Int(self.connections.stats.connecting) + Int(self.connections.stats.backingOff)
+                let uncovered = min(
+                    self.requestQueue.count - pending,
+                    self.configuration.maximumConnectionHardLimit - Int(self.connections.stats.active),
+                    self.configuration.maximumConcurrentConnectionRequests - Int(self.connections.stats.connecting)
+                )
+                for _ in 0..<max(0, uncovered) {
+                    newRequests.append(self.connections.createNewConnection())
+                }
+            }
+
+            let connectionAction: ConnectionAction
+            switch newRequests.count {
+            case 0:
                 connectionAction = .cancelTimers(closedConnectionAction.timersToCancel)
+            case 1:
+                connectionAction = .makeConnection(newRequests.first!, closedConnectionAction.timersToCancel)
+            default:
+                connectionAction = .makeConnectionsCancelAndScheduleTimers(newRequests, closedConnectionAction.timersToCancel, [])
             }
 
             return .init(request: .none, connection: connectionAction)
@@ -839,10 +872,18 @@ struct PoolStateMachine<
         if !requests.isEmpty {
             let leaseResult = self.connections.leaseConnection(at: index, streams: UInt16(requests.count))
             let connectionsRequired: Int
-            // if request count is less than available streams and leased streams plus incoming connections then only 
-            // ensure we have minimum connections otherwise grow the number of connections
-            if (self.requestQueue.count + 1) <= self.connections.stats.availableStreams + self.connections.stats.leasedStreams + self.connections.stats.connecting {
-                connectionsRequired = self.configuration.minimumConnectionCount - Int(self.connections.stats.active)
+            let minimumRequired = self.configuration.minimumConnectionCount - Int(self.connections.stats.active)
+            if case .running = self.poolState {
+                // Every queued request must be covered by a connection that is being created or
+                // retried, as `leaseConnection` requires. Leased streams return only when their
+                // holders release them, so they cannot cover a request: a creation attempt
+                // discarded while the pool was failing would otherwise strand its request until an
+                // unrelated release, and forever when the holders wait for that request.
+                let pending = Int(self.connections.stats.connecting) + Int(self.connections.stats.backingOff)
+                connectionsRequired = max(minimumRequired, self.requestQueue.count - pending)
+            } else if (self.requestQueue.count + 1) <= self.connections.stats.availableStreams + self.connections.stats.leasedStreams + self.connections.stats.connecting {
+                // While connection creation is failing, keep to the single retry in flight.
+                connectionsRequired = minimumRequired
             } else {
                 connectionsRequired = 1
             }
